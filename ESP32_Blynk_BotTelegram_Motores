@@ -1,0 +1,183 @@
+
+// ======== ESP32: Motores + Blynk + HC-SR04 + Telegram ========
+#define BLYNK_TEMPLATE_ID    "TMPL2yqQ0ik4n"
+#define BLYNK_TEMPLATE_NAME  "Carrito móvil"
+#define BLYNK_AUTH_TOKEN     "7CfQlwvoulsMg6cYcqnRq5j--LJiozuI"
+#define BLYNK_PRINT Serial
+
+#include <Arduino.h>
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include <BlynkSimpleEsp32.h>
+#include <UniversalTelegramBot.h>
+#include <NewPing.h>
+
+// ——— Credenciales Wi-Fi y Blynk ———
+const char* ssid     = "Mauro";
+const char* password = "mauro1234";
+
+// ——— Bot de Telegram ———
+String chatId   = "1529115103";
+String BOTtoken = "7788785613:AAGtovRiu5UW0tN3uU9FaSrpMPkWpicgXaY";
+WiFiClientSecure clientTCP;
+UniversalTelegramBot bot(BOTtoken, clientTCP);
+
+// ——— Pines del L298N (ajustados correctamente) ———
+#define ENA  13  // PWM Motor A
+#define IN1  14
+#define IN2  15
+#define ENB  12  // PWM Motor B
+#define IN3  27
+#define IN4  26
+
+// ——— Pines del sensor ultrasónico ———
+#define TRIG_PIN     23
+#define ECHO_PIN     32
+#define MAX_DISTANCE 200
+NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DISTANCE);
+
+// ——— Variables de control ———
+bool forwardCmd = false, backwardCmd = false, leftCmd = false, rightCmd = false;
+int Speed = 51;  // Inicial = 20% (1*51)
+
+// ——— Temporizadores ———
+unsigned long lastPingTime = 0;
+unsigned long pingInterval = 200;
+bool alertSent = false;
+int botRequestDelay = 500;
+unsigned long lastTimeBotRan = 0;
+
+// ======== SETUP ========
+void setup() {
+  Serial.begin(115200);
+  delay(100);
+  Serial.println("\n=== Iniciando ESP32 ===");
+
+  // Pines motores
+  pinMode(ENA, OUTPUT); pinMode(ENB, OUTPUT);
+  pinMode(IN1, OUTPUT); pinMode(IN2, OUTPUT);
+  pinMode(IN3, OUTPUT); pinMode(IN4, OUTPUT);
+
+  // Pines sensor
+  pinMode(TRIG_PIN, OUTPUT);
+  pinMode(ECHO_PIN, INPUT);
+
+  // Wi-Fi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.print("Conectando a Wi-Fi");
+  while (WiFi.status() != WL_CONNECTED) {
+    delay(500); Serial.print(".");
+  }
+  Serial.println("\n✅ Wi-Fi conectado: " + WiFi.localIP().toString());
+
+  // Blynk
+  Blynk.begin(BLYNK_AUTH_TOKEN, ssid, password);
+  Serial.println("✅ Blynk conectado");
+
+  // Telegram
+  clientTCP.setInsecure();
+  Serial.println("✅ Telegram listo");
+}
+
+// ======== LOOP ========
+void loop() {
+  Blynk.run();
+
+  // Sensor cada 200ms
+  if (millis() - lastPingTime >= pingInterval) {
+    lastPingTime = millis();
+    int dist = sonar.ping_cm();
+    if (dist > 0) Serial.printf("Distancia: %d cm\n", dist);
+
+    if (dist > 1 && dist <= 20) {
+      carStop();
+      if (!alertSent) {
+        bot.sendMessage(chatId, "🚨 ¡Objeto detectado a " + String(dist) + " cm! Detenido.", "");
+        alertSent = true;
+      }
+    } else {
+      alertSent = false;
+      if (forwardCmd)      carForward();
+      else if (backwardCmd) carBackward();
+      else if (leftCmd)     carLeft();
+      else if (rightCmd)    carRight();
+      else                  carStop();
+    }
+  }
+
+  // Reconexión Wi-Fi
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠ Wi-Fi perdido. Reintentando...");
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+  }
+
+  // Telegram cada 500ms
+  if (millis() - lastTimeBotRan > botRequestDelay) {
+    int newMsg = bot.getUpdates(bot.last_message_received + 1);
+    if (newMsg) handleNewMessages(newMsg);
+    lastTimeBotRan = millis();
+  }
+}
+
+// ======== COMANDOS TELEGRAM ========
+void handleNewMessages(int count) {
+  for (int i = 0; i < count; i++) {
+    String text = bot.messages[i].text;
+    String cid  = bot.messages[i].chat_id;
+    if (cid == chatId) {
+      if (text == "/start") {
+        bot.sendMessage(chatId,
+          "🤖 ¡Hola! El carrito está listo.\nControla con Blynk.\nAlerta cuando hay obstáculo.",
+          "Markdown");
+      } else {
+        bot.sendMessage(chatId, "Comando desconocido. Usa /start", "");
+      }
+    }
+  }
+}
+
+// ======== CONTROL BLYNK ========
+BLYNK_WRITE(V0) { forwardCmd  = param.asInt(); }
+BLYNK_WRITE(V1) { backwardCmd = param.asInt(); }
+BLYNK_WRITE(V2) { leftCmd     = param.asInt(); }
+BLYNK_WRITE(V3) { rightCmd    = param.asInt(); }
+BLYNK_WRITE(V4) {
+  int val = param.asInt();
+  val = constrain(val, 1, 5);
+  Speed = val * 51;
+  Serial.printf("→ Velocidad %d → PWM %d\n", val, Speed);
+}
+
+// ======== FUNCIONES DE MOVIMIENTO ========
+void carStop() {
+  analogWrite(ENA, 0);
+  analogWrite(ENB, 0);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, LOW);
+}
+
+void carForward() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, Speed); analogWrite(ENB, Speed);
+}
+
+void carBackward() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  analogWrite(ENA, Speed); analogWrite(ENB, Speed);
+}
+
+void carLeft() {
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
+  analogWrite(ENA, Speed); analogWrite(ENB, Speed);
+}
+
+void carRight() {
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
+  analogWrite(ENA, Speed); analogWrite(ENB, Speed);
+}
