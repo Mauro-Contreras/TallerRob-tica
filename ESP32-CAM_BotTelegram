@@ -1,0 +1,309 @@
+#include <WiFi.h>
+#include <WiFiClientSecure.h>
+#include "soc/soc.h"
+#include "soc/rtc_cntl_reg.h"
+#include "esp_camera.h"
+#include <UniversalTelegramBot.h>
+#include <ArduinoJson.h>
+#include <Wire.h>
+
+// Credenciales WiFi
+const char* ssid = "Mauro";
+const char* password = "mauro1234";
+
+// ID de chat y token de Telegram (como String)
+String chatId   = "1529115103";
+String BOTtoken = "7788785613:AAGtovRiu5UW0tN3uU9FaSrpMPkWpicgXaY";
+
+// Variable para envío de foto por comando
+bool sendPhotoCommand  = false;
+
+// Cliente TLS y bot de Telegram
+WiFiClientSecure clientTCP;
+UniversalTelegramBot bot(BOTtoken, clientTCP);
+
+// Pines de la cámara AI Thinker
+#define PWDN_GPIO_NUM 32
+#define RESET_GPIO_NUM -1
+#define XCLK_GPIO_NUM  0
+#define SIOD_GPIO_NUM 26
+#define SIOC_GPIO_NUM 27
+#define Y9_GPIO_NUM   35
+#define Y8_GPIO_NUM   34
+#define Y7_GPIO_NUM   39
+#define Y6_GPIO_NUM   36
+#define Y5_GPIO_NUM   21
+#define Y4_GPIO_NUM   19
+#define Y3_GPIO_NUM   18
+#define Y2_GPIO_NUM    5
+#define VSYNC_GPIO_NUM 25
+#define HREF_GPIO_NUM  23
+#define PCLK_GPIO_NUM  22
+
+// Variable para evitar accesos simultáneos a la cámara
+volatile bool camEnUso = false;
+
+// Variables de tiempo para mensajes y reconexión WiFi
+int botRequestDelay = 500;      // milisegundos entre cada petición a Telegram
+long lastTimeBotRan = 0;        // timestamp de la última petición
+
+// Prototipos
+void handleNewMessages(int numNewMessages);
+String sendPhotoTelegram();
+
+void setup() {
+  // Deshabilitar brownout (evita resets inesperados en ESP32-CAM)
+  WRITE_PERI_REG(RTC_CNTL_BROWN_OUT_REG, 0);
+
+  Serial.begin(115200);
+  delay(500);
+  Serial.println();
+  Serial.println("=== Arrancando ESP32-CAM con Telegram ===");
+
+  // 1) Conectar a Wi-Fi
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(ssid, password);
+  Serial.printf("Conectando a Wi-Fi: SSID=\"%s\"\n", ssid);
+
+  unsigned long startWait = millis();
+  while (millis() - startWait < 30000UL) {  // timeout a los 30 s
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("✅ Wi-Fi conectado.");
+      Serial.print("   → IP asignada: ");
+      Serial.println(WiFi.localIP());
+      break;
+    }
+    Serial.print(".");
+    delay(500);
+  }
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println();
+    Serial.println("❌ No se conectó a Wi-Fi en 30 segundos.");
+    Serial.println("   → Subir de nuevo o revisar credenciales.");
+  }
+
+  // 2) Configurar cliente TLS para Telegram
+  // Elegimos setInsecure() para descartar problemas de certificado
+  clientTCP.setInsecure();
+  Serial.println("✅ Cliente TLS configurado con setInsecure().");
+
+  // 3) Inicializar cámara AI-Thinker
+  camera_config_t config;
+  config.ledc_channel = LEDC_CHANNEL_0;
+  config.ledc_timer   = LEDC_TIMER_0;
+  config.pin_d0       = Y2_GPIO_NUM;
+  config.pin_d1       = Y3_GPIO_NUM;
+  config.pin_d2       = Y4_GPIO_NUM;
+  config.pin_d3       = Y5_GPIO_NUM;
+  config.pin_d4       = Y6_GPIO_NUM;
+  config.pin_d5       = Y7_GPIO_NUM;
+  config.pin_d6       = Y8_GPIO_NUM;
+  config.pin_d7       = Y9_GPIO_NUM;
+  config.pin_xclk     = XCLK_GPIO_NUM;
+  config.pin_pclk     = PCLK_GPIO_NUM;
+  config.pin_vsync    = VSYNC_GPIO_NUM;
+  config.pin_href     = HREF_GPIO_NUM;
+  config.pin_sscb_sda = SIOD_GPIO_NUM;
+  config.pin_sscb_scl = SIOC_GPIO_NUM;
+  config.pin_pwdn     = PWDN_GPIO_NUM;
+  config.pin_reset    = RESET_GPIO_NUM;
+  config.xclk_freq_hz = 20000000;
+  config.pixel_format = PIXFORMAT_JPEG;
+
+  // Ajustar resolución según PSRAM
+  if (psramFound()) {
+    config.frame_size   = FRAMESIZE_VGA;
+    config.jpeg_quality = 12;
+    config.fb_count     = 2;
+    Serial.println("PSRAM detectada: usando VGA, calidad 12, fb_count=2");
+  } else {
+    config.frame_size   = FRAMESIZE_SVGA;
+    config.jpeg_quality = 12;
+    config.fb_count     = 1;
+    Serial.println("Sin PSRAM: usando SVGA, calidad 12, fb_count=1");
+  }
+
+  esp_err_t err = esp_camera_init(&config);
+  if (err != ESP_OK) {
+    Serial.printf("❌ Error al inicializar la cámara (0x%x). Reiniciando...\n", err);
+    delay(2000);
+    ESP.restart();
+  }
+  Serial.println("✅ Cámara AI-Thinker inicializada.");
+
+  // ¡Listo! Ahora entramos al loop.
+  Serial.println("Setup completado. Entrando a loop().");
+}
+
+void loop() {
+  // 1) Si el Wi-Fi se desconecta, intentar reconectar
+  if (WiFi.status() != WL_CONNECTED) {
+    Serial.println("⚠ Wi-Fi desconectado. Intentando reconectar...");
+    WiFi.disconnect();
+    WiFi.begin(ssid, password);
+    unsigned long t0 = millis();
+    while (WiFi.status() != WL_CONNECTED && millis() - t0 < 15000UL) {
+      Serial.print(".");
+      delay(500);
+    }
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println();
+      Serial.println("✅ Reconectado a Wi-Fi!");
+      Serial.print("   → IP: ");
+      Serial.println(WiFi.localIP());
+    } else {
+      Serial.println();
+      Serial.println("❌ No se reconectó a Wi-Fi en 15 s.");
+      // Seguimos ejecutando, pero el bot no funcionará hasta que haya Wi-Fi
+    }
+  }
+
+  // 2) Si llega el comando /foto, enviar foto
+  if (sendPhotoCommand) {
+    Serial.println("📸 Llamando a sendPhotoTelegram() por comando...");
+    String resultado = sendPhotoTelegram();
+    Serial.printf("   → sendPhotoTelegram() devolvió: \"%s\"\n", resultado.c_str());
+    sendPhotoCommand = false;
+  }
+
+  // 3) Cada botRequestDelay ms, revisar si hay mensajes nuevos en Telegram
+  if (millis() - lastTimeBotRan > botRequestDelay) {
+    int numNewMessages = bot.getUpdates(bot.last_message_received + 1);
+    if (numNewMessages) {
+      Serial.printf(">>> Hay %d mensaje(s) nuevo(s) en Telegram.\n", numNewMessages);
+      handleNewMessages(numNewMessages);
+    }
+    lastTimeBotRan = millis();
+  }
+}
+
+// Esta función se encarga de procesar cada mensaje entrante de Telegram
+void handleNewMessages(int numNewMessages) {
+  for (int i = 0; i < numNewMessages; i++) {
+    String text = bot.messages[i].text;
+    String cid  = bot.messages[i].chat_id;
+    Serial.printf("   - Mensaje[%d] desde chat_id=%s: \"%s\"\n", i, cid.c_str(), text.c_str());
+
+    // Solo respondemos si el chat_id coincide con chatId
+    if (cid == chatId) {
+      if (text == "/start") {
+        Serial.println("   → Comando /start recibido");
+        String welcome  = "🤖 Alarma ESP32-CAM lista y funcionando.\n\n";
+               welcome += "/foto : Tomar una foto en el momento.\n";
+        bool ok = bot.sendMessage(chatId, welcome, "Markdown");
+        Serial.printf("      Mensaje de bienvenida enviado: %s\n", ok ? "OK" : "FALLÓ");
+      }
+      else if (text == "/foto" || text == "/tomarfoto") {
+        Serial.println("   → Comando /foto recibido");
+        bool okNoti = bot.sendMessage(chatId, "📸 Tomando foto por comando /foto…", "");
+        Serial.printf("      Mensaje \"Tomando foto...\" enviado: %s\n", okNoti ? "OK" : "FALLÓ");
+        sendPhotoCommand = true;
+      }
+      else {
+        Serial.println("   → Comando no reconocido.");
+        bot.sendMessage(chatId, "Comando desconocido. Usa /foto", "");
+      }
+    } else {
+      Serial.println("   ⚠ chat_id no coincide; ignorando mensaje.");
+    }
+  }
+}
+
+// Aquí armamos manualmente el multipart/form-data y lo enviamos por HTTPS a Telegram
+String sendPhotoTelegram() {
+  // Evitar llamadas concurrentes
+  if (camEnUso) {
+    Serial.println("    ⚠ Cámara ocupada; no se envía foto.");
+    return "Cámara ocupada";
+  }
+  camEnUso = true;
+
+  // 1) Configurar la cámara al tamaño y calidad deseados
+  sensor_t * s = esp_camera_sensor_get();
+  if (!s) {
+    Serial.println("    ❌ Error: sensor no encontrado.");
+    camEnUso = false;
+    return "Error sensor nulo";
+  }
+  s->set_framesize(s, FRAMESIZE_QQVGA);
+  s->set_quality(s, 12);
+  delay(200);
+
+  // 2) Capturar la imagen
+  camera_fb_t * fb = esp_camera_fb_get();
+  if (!fb) {
+    Serial.println("    ❌ Error al capturar imagen.");
+    camEnUso = false;
+    delay(1000);
+    ESP.restart();
+    return "Error captura";
+  }
+  Serial.printf("    → Captura de imagen exitosa (%u bytes)\n", fb->len);
+
+  // 3) Preparar multipart/form-data
+  const char* telegramHost = "api.telegram.org";
+  String boundary = "Esp32CamBoundary";
+
+  String head = "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"chat_id\"\r\n\r\n";
+  head += chatId + "\r\n";
+  head += "--" + boundary + "\r\n";
+  head += "Content-Disposition: form-data; name=\"photo\"; filename=\"esp32-cam.jpg\"\r\n";
+  head += "Content-Type: image/jpeg\r\n\r\n";
+
+  String tail = "\r\n--" + boundary + "--\r\n";
+
+  size_t imageLen = fb->len;
+  size_t extraLen = head.length() + tail.length();
+  size_t totalLen = imageLen + extraLen;
+
+  // 4) Conectar por TLS a Telegram
+  Serial.println("    → Conectando a api.telegram.org:443 ...");
+  if (!clientTCP.connect(telegramHost, 443)) {
+    Serial.println("    ❌ Conexión TLS FALLIDA");
+    esp_camera_fb_return(fb);
+    camEnUso = false;
+    return "Error conexión TLS";
+  }
+  Serial.println("    → Conexión TLS EXITOSA");
+
+  // 5) Enviar encabezados HTTP POST
+  clientTCP.println("POST /bot" + BOTtoken + "/sendPhoto HTTP/1.1");
+  clientTCP.println("Host: " + String(telegramHost));
+  clientTCP.println("Content-Length: " + String(totalLen));
+  clientTCP.println("Content-Type: multipart/form-data; boundary=" + boundary);
+  clientTCP.println();
+  clientTCP.print(head);
+  clientTCP.write(fb->buf, fb->len);
+  clientTCP.print(tail);
+  Serial.printf("    → Multipart enviado (header %u bytes + foto %u bytes + tail %u bytes)\n",
+                head.length(), imageLen, tail.length());
+
+  // Liberar el frame buffer
+  esp_camera_fb_return(fb);
+
+  // 6) Leer respuesta HTTP de Telegram (hasta 3 s)
+  String response = "";
+  unsigned long t0 = millis();
+  while (millis() - t0 < 3000) {
+    while (clientTCP.available()) {
+      char c = clientTCP.read();
+      response += c;
+    }
+    if (response.length() > 0) break;
+    delay(10);
+  }
+
+  Serial.println("    ↪ Respuesta completa de Telegram:");
+  Serial.println(response);
+
+  // Cerrar conexión
+  clientTCP.stop();
+
+  // 7) Restaurar ajustes de cámara
+  s->set_framesize(s, FRAMESIZE_QQVGA);
+  s->set_quality(s, 18);
+
+  camEnUso = false;
+  return "OK";
+}
