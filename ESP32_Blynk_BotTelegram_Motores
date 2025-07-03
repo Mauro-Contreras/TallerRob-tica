@@ -1,4 +1,3 @@
-
 // ======== ESP32: Motores + Blynk + HC-SR04 + Telegram ========
 #define BLYNK_TEMPLATE_ID    "TMPL2yqQ0ik4n"
 #define BLYNK_TEMPLATE_NAME  "Carrito móvil"
@@ -38,7 +37,7 @@ NewPing sonar(TRIG_PIN, ECHO_PIN, MAX_DISTANCE);
 
 // ——— Variables de control ———
 bool forwardCmd = false, backwardCmd = false, leftCmd = false, rightCmd = false;
-int Speed = 51;  // Inicial = 20% (1*51)
+int Speed = 100;  // Inicial = 50% (1*100)
 
 // ——— Temporizadores ———
 unsigned long lastPingTime = 0;
@@ -145,8 +144,8 @@ BLYNK_WRITE(V2) { leftCmd     = param.asInt(); }
 BLYNK_WRITE(V3) { rightCmd    = param.asInt(); }
 BLYNK_WRITE(V4) {
   int val = param.asInt();
-  val = constrain(val, 1, 5);
-  Speed = val * 51;
+  val = constrain(val, 1, 2);
+  Speed = val * 100;
   Serial.printf("→ Velocidad %d → PWM %d\n", val, Speed);
 }
 
@@ -159,25 +158,29 @@ void carStop() {
 }
 
 void carForward() {
-  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
-  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
-  analogWrite(ENA, Speed); analogWrite(ENB, Speed);
+  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);   // Motor A adelante
+  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);   // Motor B adelante
+  analogWrite(ENA, Speed);
+  analogWrite(ENB, Speed);
 }
 
 void carBackward() {
-  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
-  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
-  analogWrite(ENA, Speed); analogWrite(ENB, Speed);
+  digitalWrite(IN1, HIGH);  digitalWrite(IN2, LOW);
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);
+  analogWrite(ENA, Speed);
+  analogWrite(ENB, Speed);
 }
 
 void carLeft() {
-  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);
-  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);
-  analogWrite(ENA, Speed); analogWrite(ENB, Speed);
+  digitalWrite(IN1, HIGH);  digitalWrite(IN2, LOW);  // A reversa
+  digitalWrite(IN3, HIGH); digitalWrite(IN4, LOW);   // B adelante
+  analogWrite(ENA, Speed);
+  analogWrite(ENB, Speed);
 }
 
 void carRight() {
-  digitalWrite(IN1, HIGH); digitalWrite(IN2, LOW);
-  digitalWrite(IN3, LOW); digitalWrite(IN4, HIGH);
-  analogWrite(ENA, Speed); analogWrite(ENB, Speed);
+  digitalWrite(IN1, LOW); digitalWrite(IN2, HIGH);   // A adelante
+  digitalWrite(IN3, LOW);  digitalWrite(IN4, HIGH);  // B reversa
+  analogWrite(ENA, Speed);
+  analogWrite(ENB, Speed);
 }
